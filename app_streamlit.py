@@ -51,6 +51,16 @@ with st.expander("OR-Tools (advanced)"):
 with st.expander("Local OSRM refinement (optional, free)"):
     use_osrm = st.checkbox("Refine with local OSRM per leg", value=False)
     osrm_base = st.text_input("Local OSRM URL", value="http://localhost:5000")
+    backend_costs = st.selectbox(
+        "Solver cost matrix",
+        ["Haversine (fast, approximate)", "OSRM (road-accurate, local)"],
+        index=0
+    )
+    osrm_block = st.number_input(
+        "OSRM /table block size (tile)",
+        min_value=50, max_value=200, value=100, step=10,
+        help="Bigger = fewer requests but longer URLs. 100 is a good default."
+    )
     if use_osrm:
         st.info("Refines leg km/min after solving via your local OSRM. One request per leg.")
 
@@ -203,9 +213,27 @@ if run and uploaded is not None:
             st.write(f"📍 Total locations passed to solver (incl. depot): {len(stops)}")
 
             # MATRIX
-            st_status.update(label="Building offline (haversine) matrix…", state="running")
-            matrix = core.build_haversine_matrix(stops, avg_speed)
-            st.write("✅ Matrix built")
+            if backend_costs.startswith("OSRM"):
+                st_status.update(label="Building OSRM (road-accurate) matrix…", state="running")
+                prog = st.progress(0.0)
+
+
+                def _cb(done, total):
+                    prog.progress(done / total)
+
+
+                matrix = core.build_osrm_matrix_batched(
+                    stops,
+                    base_url=osrm_base,
+                    block=int(osrm_block),
+                    sleep=0.0,
+                    progress_cb=_cb
+                )
+                st.write("✅ OSRM matrix built")
+            else:
+                st_status.update(label="Building offline (haversine) matrix…", state="running")
+                matrix = core.build_haversine_matrix(stops, avg_speed)
+                st.write("✅ Matrix built")
 
             # SOLVE
             st_status.update(label="Solving routes…", state="running")
@@ -224,10 +252,11 @@ if run and uploaded is not None:
             else:
                 st_status.update(label="Exporting results…", state="running")
 
+            use_refine = use_osrm and not backend_costs.startswith("OSRM")
             df_routes, summary = core.export_outputs(
                 stops, matrix, sol, equality_basis,
                 export_csv=None, export_xlsx=None, per_stop_min=per_stop_min,
-                use_osrm=use_osrm, osrm_base=osrm_base
+                use_osrm=use_refine, osrm_base=osrm_base
             )
 
             # Persist outputs (so they survive reruns)
