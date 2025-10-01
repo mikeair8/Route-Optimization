@@ -38,6 +38,87 @@ def build_haversine_matrix(stops: List[Stop], avg_speed_kmh: float) -> Matrix:
             dur[i][j] = (d / max(1e-6, avg_speed_kmh)) * 60.0
     return Matrix(distances_km=dist, durations_min=dur)
 
+def build_osrm_matrix_batched(
+    stops,
+    base_url: str = "http://localhost:5000",
+    block: int = 100,
+    sleep: float = 0.0,
+    progress_cb=None,  # optional: progress_cb(done_tiles, total_tiles)
+    timeout: int = 120,
+) -> Matrix:
+    """
+    Build full NxN matrix using OSRM /table, in tiles to avoid URL-size limits.
+    Distances in km, durations in minutes.
+
+    Args:
+        stops: list[Stop]
+        base_url: OSRM routed URL (your local server)
+        block: tile size (sources x destinations)
+        sleep: seconds to sleep between tile requests
+        progress_cb: optional callback to report progress
+        timeout: request timeout seconds
+    """
+    import time
+    n = len(stops)
+    dist_km = [[0.0] * n for _ in range(n)]
+    dur_min = [[0.0] * n for _ in range(n)]
+
+    # Pre-cache coordinates
+    lats = [s.lat for s in stops]
+    lons = [s.lon for s in stops]
+
+    # Number of tiles
+    tiles_i = list(range(0, n, block))
+    tiles_j = list(range(0, n, block))
+    total_tiles = len(tiles_i) * len(tiles_j)
+    done = 0
+
+    for oi in tiles_i:
+        src = list(range(oi, min(oi + block, n)))
+        for dj in tiles_j:
+            dst = list(range(dj, min(dj + block, n)))
+
+            # Build a compact coordinate list (only the src∪dst for this tile)
+            uniq = sorted(set(src + dst))
+            remap = {old: i for i, old in enumerate(uniq)}
+            coords = ";".join(f"{lons[k]},{lats[k]}" for k in uniq)
+
+            # sources/destinations are indices into the *local* coords list
+            src_param = ";".join(str(remap[i]) for i in src)
+            dst_param = ";".join(str(remap[j]) for j in dst)
+
+            url = (
+                f"{base_url.rstrip('/')}/table/v1/driving/{coords}"
+                f"?annotations=duration,distance&sources={src_param}&destinations={dst_param}"
+            )
+
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+
+            durs = data.get("durations")
+            dists = data.get("distances")
+            if durs is None or dists is None:
+                raise RuntimeError(f"OSRM /table returned no durations/distances for tile (oi={oi}, dj={dj})")
+
+            # Fill into the global matrices
+            for si, a in enumerate(src):
+                for di, b in enumerate(dst):
+                    dur_s = durs[si][di]
+                    dis_m = dists[si][di]
+                    if dur_s is None or dis_m is None:
+                        # Unreachable; leave as 0.0 or set to large number if you prefer
+                        continue
+                    dur_min[a][b] = dur_s / 60.0
+                    dist_km[a][b] = dis_m / 1000.0
+
+            done += 1
+            if progress_cb:
+                progress_cb(done, total_tiles)
+            if sleep > 0:
+                time.sleep(sleep)
+
+    return Matrix(distances_km=dist_km, durations_min=dur_min)
 def osrm_leg_km_min(a_lat, a_lon, b_lat, b_lon, base_url="http://localhost:5000"):
     url = f"{base_url.rstrip('/')}/route/v1/driving/{a_lon},{a_lat};{b_lon},{b_lat}?overview=false"
     r = requests.get(url, timeout=30)
