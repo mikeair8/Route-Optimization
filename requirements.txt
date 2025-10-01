@@ -1,0 +1,7 @@
+pandas>=2.0.0
+openpyxl>=3.1.2
+ortools>=9.10.4067
+requests>=2.31.0
+streamlit>=1.36.0
+folium>=0.16.0
+streamlit-folium>=0.20.0
