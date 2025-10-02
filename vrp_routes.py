@@ -43,7 +43,7 @@ def build_osrm_matrix_batched(
     base_url: str = "http://localhost:5000",
     block: int = 100,
     sleep: float = 0.0,
-    progress_cb=None,  # optional: progress_cb(done_tiles, total_tiles)
+    progress_cb=None,   # optional: progress_cb(done_tiles, total_tiles)
     timeout: int = 120,
 ) -> Matrix:
     """
@@ -59,6 +59,21 @@ def build_osrm_matrix_batched(
         timeout: request timeout seconds
     """
     import time
+
+    def _osrm_get(url, timeout=120, retries=5, backoff=0.5):
+        """GET with simple exponential backoff; retries 429 and 5xx."""
+        for i in range(retries):
+            try:
+                r = requests.get(url, timeout=timeout)
+                if r.status_code in (429,) or 500 <= r.status_code < 600:
+                    raise requests.HTTPError(f"{r.status_code}: {r.text}", response=r)
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                if i == retries - 1:
+                    raise
+                time.sleep(backoff * (2 ** i))
+
     n = len(stops)
     dist_km = [[0.0] * n for _ in range(n)]
     dur_min = [[0.0] * n for _ in range(n)]
@@ -67,7 +82,7 @@ def build_osrm_matrix_batched(
     lats = [s.lat for s in stops]
     lons = [s.lon for s in stops]
 
-    # Number of tiles
+    # Tiling plan
     tiles_i = list(range(0, n, block))
     tiles_j = list(range(0, n, block))
     total_tiles = len(tiles_i) * len(tiles_j)
@@ -78,12 +93,12 @@ def build_osrm_matrix_batched(
         for dj in tiles_j:
             dst = list(range(dj, min(dj + block, n)))
 
-            # Build a compact coordinate list (only the src∪dst for this tile)
+            # Build compact coord list for this tile (src ∪ dst)
             uniq = sorted(set(src + dst))
             remap = {old: i for i, old in enumerate(uniq)}
             coords = ";".join(f"{lons[k]},{lats[k]}" for k in uniq)
 
-            # sources/destinations are indices into the *local* coords list
+            # sources/destinations are indices into the local coords list
             src_param = ";".join(str(remap[i]) for i in src)
             dst_param = ";".join(str(remap[j]) for j in dst)
 
@@ -92,29 +107,49 @@ def build_osrm_matrix_batched(
                 f"?annotations=duration,distance&sources={src_param}&destinations={dst_param}"
             )
 
-            r = requests.get(url, timeout=timeout)
-            r.raise_for_status()
-            data = r.json()
+            data = _osrm_get(url, timeout=timeout, retries=5, backoff=0.5)
 
             durs = data.get("durations")
             dists = data.get("distances")
             if durs is None or dists is None:
-                raise RuntimeError(f"OSRM /table returned no durations/distances for tile (oi={oi}, dj={dj})")
+                raise RuntimeError(
+                    f"OSRM /table returned no durations/distances for tile (oi={oi}, dj={dj})"
+                )
 
-            # Fill into the global matrices
+            # Fill global matrices; penalize unreachable pairs heavily
             for si, a in enumerate(src):
                 for di, b in enumerate(dst):
                     dur_s = durs[si][di]
                     dis_m = dists[si][di]
-                    if dur_s is None or dis_m is None:
-                        # Unreachable; leave as 0.0 or set to large number if you prefer
-                        continue
-                    dur_min[a][b] = dur_s / 60.0
-                    dist_km[a][b] = dis_m / 1000.0
+                    INF_MIN = 1e9  # huge minutes to make unreachable edges undesirable
+                    INF_KM = 1e9
+                    for si, a in enumerate(src):
+                        for di, b in enumerate(dst):
+                            dur_s = durs[si][di]
+                            dis_m = dists[si][di]
+                            if a == b:
+                                dur_min[a][b] = 0.0
+                                dist_km[a][b] = 0.0
+                                continue
+                            if dur_s is None or dis_m is None:
+                                # unreachable → punish heavily
+                                dur_min[a][b] = INF_MIN
+                                dist_km[a][b] = INF_KM
+                            else:
+                                mm = dur_s / 60.0
+                                km = dis_m / 1000.0
+                                # guard against accidental zeros off-diagonal
+                                if mm <= 0.0: mm = 1e-6
+                                if km <= 0.0: km = 1e-6
+                                dur_min[a][b] = mm
+                                dist_km[a][b] = km
 
             done += 1
             if progress_cb:
-                progress_cb(done, total_tiles)
+                try:
+                    progress_cb(done, total_tiles)
+                except Exception:
+                    pass
             if sleep > 0:
                 time.sleep(sleep)
 
@@ -128,6 +163,21 @@ def osrm_leg_km_min(a_lat, a_lon, b_lat, b_lon, base_url="http://localhost:5000"
     km = route["distance"] / 1000.0
     minutes = route["duration"] / 60.0
     return km, minutes
+
+def _osrm_get(url, timeout=120, retries=5, backoff=0.5):
+    import time as _t
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            # Treat 429/5xx as retryable
+            if r.status_code in (429,) or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"{r.status_code}: {r.text}", response=r)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if i == retries - 1:
+                raise
+            _t.sleep(backoff * (2 ** i))
 
 def kmeans_lloyd(points, k, iters=50, seed=42):
     import random
