@@ -154,6 +154,7 @@ def build_osrm_matrix_batched(
                 time.sleep(sleep)
 
     return Matrix(distances_km=dist_km, durations_min=dur_min)
+
 def osrm_leg_km_min(a_lat, a_lon, b_lat, b_lon, base_url="http://localhost:5000"):
     url = f"{base_url.rstrip('/')}/route/v1/driving/{a_lon},{a_lat};{b_lon},{b_lat}?overview=false"
     r = requests.get(url, timeout=30)
@@ -198,6 +199,141 @@ def kmeans_lloyd(points, k, iters=50, seed=42):
         if new==centers: break
         centers=new
     return assign
+
+def coalesce_nearby(
+    df: pd.DataFrame,
+    threshold_m: float = 1.0,
+    service_mode: str = "sum",   # "sum" or "one"
+    name_mode: str = "first",    # "first" or "concat"
+    per_stop_min_default: float = 2.0,
+) -> pd.DataFrame:
+    """
+    Merge rows whose coordinates are within threshold_m meters.
+    Returns a new DataFrame with lat/lon/id/name/service_min (and any other columns kept from the representative).
+
+    service_mode:
+      - "sum": service_min is sum of all members (each original stop counts)
+      - "one": service_min is taken from the first row (or per_stop_min_default if missing)
+
+    name_mode:
+      - "first": keep the first row's name/id
+      - "concat": join names/ids with " + "
+    """
+    if df.empty:
+        return df.copy()
+
+    # Ensure columns exist
+    out = df.copy()
+    if "service_min" not in out.columns:
+        out["service_min"] = per_stop_min_default
+    if "id" not in out.columns:
+        out["id"] = [f"S{i}" for i in range(len(out))]
+    if "name" not in out.columns:
+        out["name"] = out["id"]
+
+    # Build spatial hash (grid) + union-find for clustering
+    import math
+
+    def deg_per_m_lon(lat_deg: float) -> float:
+        # degrees longitude per meter at a given latitude
+        lat_rad = math.radians(lat_deg)
+        deg_per_m_lat = 1.0 / 111320.0
+        return deg_per_m_lat / max(1e-9, math.cos(lat_rad))
+
+    # Grid size in degrees
+    # (we compute per-point lon cell size using its latitude)
+    deg_per_m_lat = 1.0 / 111320.0
+    lat_cell = deg_per_m_lat * threshold_m
+
+    # Union-Find
+    parent = list(range(len(out)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Build buckets: key = (lat_key, lon_key_approx)
+    # We’ll also check neighbor cells to avoid boundary misses.
+    buckets = {}
+    lats = out["lat"].to_numpy()
+    lons = out["lon"].to_numpy()
+
+    for i, (la, lo) in enumerate(zip(lats, lons)):
+        lon_cell = deg_per_m_lon(la) * threshold_m
+        key_lat = int(round(la / max(1e-12, lat_cell)))
+        key_lon = int(round(lo / max(1e-12, lon_cell)))
+        buckets.setdefault((key_lat, key_lon), []).append(i)
+
+    # Check neighbors and union points within threshold by actual haversine
+    for (klat, klon), idxs in list(buckets.items()):
+        # candidates from 3x3 neighborhood
+        neigh = []
+        for dlat in (-1, 0, 1):
+            for dlon in (-1, 0, 1):
+                neigh.extend(buckets.get((klat + dlat, klon + dlon), []))
+        # de-dup
+        neigh = list(set(neigh))
+        for i in idxs:
+            for j in neigh:
+                if i >= j:
+                    continue
+                d = haversine_km(lats[i], lons[i], lats[j], lons[j]) * 1000.0  # meters
+                if d <= threshold_m + 1e-9:
+                    union(i, j)
+
+    # Collect clusters
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for i in range(len(out)):
+        groups[find(i)].append(i)
+
+    # Build merged rows
+    rows = []
+    for root, idxs in groups.items():
+        subset = out.iloc[idxs]
+        # Representative coordinates: average
+        lat_mean = float(subset["lat"].mean())
+        lon_mean = float(subset["lon"].mean())
+
+        # ID/Name
+        if name_mode == "concat":
+            id_val = " + ".join(map(str, subset["id"].tolist()))
+            name_val = " + ".join(map(str, subset["name"].tolist()))
+        else:
+            id_val = str(subset.iloc[0]["id"])
+            name_val = str(subset.iloc[0]["name"])
+
+        # Service
+        if service_mode == "sum":
+            svc = float(pd.to_numeric(subset["service_min"], errors="coerce").fillna(per_stop_min_default).sum())
+        else:  # "one"
+            first = subset.iloc[0]
+            svc = float(pd.to_numeric(first.get("service_min", per_stop_min_default), errors="coerce")
+                        .fillna(per_stop_min_default))
+
+        # Keep other columns from the first representative (optional)
+        row = dict(subset.iloc[0])
+        row.update({
+            "id": id_val,
+            "name": name_val,
+            "lat": round(lat_mean, 7),
+            "lon": round(lon_mean, 7),
+            "service_min": max(0.0, svc),
+            "coalesced_count": len(subset),
+        })
+        rows.append(row)
+
+    merged = pd.DataFrame(rows)
+    # Ensure core columns order first
+    core_cols = [c for c in ["id", "name", "lat", "lon", "service_min", "coalesced_count"] if c in merged.columns]
+    other_cols = [c for c in merged.columns if c not in core_cols]
+    merged = merged[core_cols + other_cols]
+    return merged
 
 def nearest_neighbor_route(idx_list,matrix):
     un=set(idx_list[1:]); route=[idx_list[0]]; cur=idx_list[0]

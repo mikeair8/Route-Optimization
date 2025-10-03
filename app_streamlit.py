@@ -74,6 +74,16 @@ with st.expander("Depot & filters (optional)"):
     active_col = st.text_input("Active column name (case-insensitive)", value="Status active")
     active_values = st.text_input("Active values (comma-separated, case-insensitive)", value="yes, active, true, 1")
 
+with st.expander("Near-duplicate cleanup (optional)"):
+    enable_coalesce = st.checkbox("Coalesce stops within a distance", value=False)
+    coalesce_m = st.number_input("Coalesce threshold (meters)", min_value=0.1, value=1.0, step=0.5)
+    service_mode = st.selectbox(
+        "Service time for a coalesced point",
+        ["Sum all services (each original counts)", "Count once (single service)"],
+        index=0
+    )
+    name_mode = st.selectbox("Merged label", ["Keep first", "Concatenate with +"], index=0)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def robust_read(uploaded_file, default_sep=None):
     raw = uploaded_file.getvalue()
@@ -197,8 +207,30 @@ if run and uploaded is not None:
             # COORDS
             st_status.update(label="Validating coordinates…", state="running")
             df = sanitize_coords(df, per_stop_min)
+
+            # Optional: coalesce near-duplicates
+            if enable_coalesce:
+                st.status("Coalescing near-duplicate stops…")
+                smode = "sum" if service_mode.startswith("Sum") else "one"
+                n_before = len(df)
+                df = core.coalesce_nearby(
+                    df,
+                    threshold_m=float(coalesce_m),
+                    service_mode=smode,
+                    name_mode=("concat" if name_mode.startswith("Concatenate") else "first"),
+                    per_stop_min_default=per_stop_min,
+                )
+                n_after = len(df)
+                if n_after < n_before:
+                    st.success(f"Coalesced {n_before - n_after} nearby stops into existing points "
+                               f"(now {n_after} rows; service_mode='{smode}').")
+                else:
+                    st.info("No near-duplicates found within the chosen threshold.")
+
+            # Optional: first-row depot
             if use_first_row_as_depot and len(df) > 0:
                 df.loc[df.index[0], "service_min"] = 0.0
+
             st.info(f"🧭 Stops detected (pre-depot): {len(df)}")
 
             # STOPS
