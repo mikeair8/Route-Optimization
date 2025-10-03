@@ -48,6 +48,17 @@ with st.expander("OR-Tools (advanced)"):
     max_route_min = st.number_input("Max route minutes", min_value=0.0, value=0.0, step=5.0)
     st.caption("Tip: For big instances, try PARALLEL_CHEAPEST_INSERTION and 120–300s.")
 
+with st.expander("Autosize vehicles from max route minutes"):
+    autosize = st.checkbox("Autosize vehicles (time-based)", value=False)
+    cap_minutes_input = st.number_input("Max route minutes (cap)", min_value=1.0, value=300.0, step=5.0)
+    autosize_buffer = st.number_input(
+        "Buffer factor (×)", min_value=1.00, value=1.15, step=0.05,
+        help="Safety multiplier. 1.15 = +15% headroom above the theoretical minimum."
+    )
+    max_vehicles_limit = st.number_input(
+        "Hard max vehicles (optional, 0 = no limit)", min_value=0, value=0, step=1
+    )
+
 with st.expander("Local OSRM refinement (optional, free)"):
     use_osrm = st.checkbox("Refine with local OSRM per leg", value=False)
     osrm_base = st.text_input("Local OSRM URL", value="http://localhost:5000")
@@ -148,6 +159,35 @@ def draw_map(df_routes: pd.DataFrame):
                 icon=BeautifyIcon(number=int(row["order"]), border_color="#333", text_color="#000")
             ).add_to(m)
     return m
+
+def _mst_total_minutes(durations_min: list[list[float]]) -> float:
+    """Prim's MST total weight (in minutes) over the full graph using durations."""
+    n = len(durations_min)
+    if n <= 1:
+        return 0.0
+    import math
+    selected = [False]*n
+    best = [math.inf]*n
+    best[0] = 0.0
+    total = 0.0
+    for _ in range(n):
+        u = -1; b = math.inf
+        for i in range(n):
+            if not selected[i] and best[i] < b:
+                b = best[i]; u = i
+        if u == -1:
+            break
+        selected[u] = True
+        if b < math.inf:
+            total += b
+        for v in range(n):
+            if not selected[v]:
+                w = durations_min[u][v]
+                if w < best[v]:
+                    best[v] = w
+    # A (loose but safe) tour upper bound is ~2×MST (tree-doubling).
+    # We'll add service minutes separately and then divide by cap.
+    return 2.0 * total  # minutes
 
 # ── Run button ────────────────────────────────────────────────────────────────
 run = st.button("🚀 Build Routes", type="primary", disabled=uploaded is None)
@@ -267,16 +307,57 @@ if run and uploaded is not None:
                 matrix = core.build_haversine_matrix(stops, avg_speed)
                 st.write("✅ Matrix built")
 
+            # --- Autosize vehicles if requested (time-based only) ---
+            vehicles_to_use = int(vehicles)
+            cap_minutes_to_use = None
+            if autosize:
+                if equality_basis != "time":
+                    st.warning("Autosize is time-based. Switch 'Balance by' to 'time' to enable.")
+                else:
+                    # Compute total service minutes (exclude depot if present: service at depot is 0 in our flow)
+                    total_service_min = 0.0
+                    for s in stops:
+                        # depot is index 0 only if you added manual depot; otherwise first row is just a stop
+                        # We include all non-negative service times
+                        total_service_min += max(0.0, float(getattr(s, "service_min", 0.0)))
+
+                    # MST-based tour upper bound in minutes from the chosen matrix
+                    mst_tour_minutes = _mst_total_minutes(matrix.durations_min)
+
+                    total_minutes_est = mst_tour_minutes + total_service_min
+                    vehicles_est = int(np.ceil((total_minutes_est / cap_minutes_input) * autosize_buffer))
+
+                    if max_vehicles_limit and vehicles_est > max_vehicles_limit:
+                        vehicles_est = max_vehicles_limit
+
+                    vehicles_est = max(1, vehicles_est)
+                    vehicles_to_use = vehicles_est
+                    cap_minutes_to_use = float(cap_minutes_input)
+
+                    st.info(
+                        f"Autosize: est_total_minutes ≈ {total_minutes_est:.0f}, "
+                        f"cap={cap_minutes_input:.0f}, buffer×{autosize_buffer:.2f} ⇒ "
+                        f"vehicles={vehicles_to_use}"
+                    )
+
             # SOLVE
             st_status.update(label="Solving routes…", state="running")
             if solver == "ortools":
-                max_limit = max_route_min if (cap_enabled and equality_basis=="time" and max_route_min > 0) else None
+                # If autosized and time-based, enforce the cap
+                if autosize and equality_basis == "time":
+                    max_limit = cap_minutes_to_use
+                    cap_enabled_effective = True
+                else:
+                    max_limit = (
+                        max_route_min if (cap_enabled and equality_basis == "time" and max_route_min > 0) else None)
+                    cap_enabled_effective = cap_enabled
+
                 sol = core.solve_vrp_ortools(
-                    stops, int(vehicles), matrix, equality_basis, per_stop_min,
+                    stops, int(vehicles_to_use), matrix, equality_basis, per_stop_min,
                     max_limit, first_solution, metaheuristic, int(time_limit_s)
                 )
             else:
-                sol = core.solve_vrp_cluster2opt(stops, int(vehicles), matrix, equality_basis, per_stop_min)
+                sol = core.solve_vrp_cluster2opt(stops, int(vehicles_to_use), matrix, equality_basis, per_stop_min)
 
             # REFINE / EXPORT
             if use_osrm:
