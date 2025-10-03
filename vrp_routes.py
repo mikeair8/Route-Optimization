@@ -370,9 +370,12 @@ def solve_vrp_ortools(stops,vehicles,matrix,equality_basis,per_stop_min,max_rout
     dim=routing.GetDimensionOrDie("measure")
     dim.SetGlobalSpanCostCoefficient(100)
     if max_route_limit is not None:
-        cap=int(max_route_limit*1000)
+        cap = int(max_route_limit * 1000)
         for v in range(vehicles):
-            dim.CumulVar(routing.End(v)).SetUpperBound(cap)
+            end_cumul = dim.CumulVar(routing.End(v))
+            # Either of these is fine:
+            end_cumul.SetRange(0, cap)  # preferred
+            # end_cumul.SetMax(cap)
     from ortools.constraint_solver import routing_enums_pb2
     fs=getattr(routing_enums_pb2.FirstSolutionStrategy,first_solution)
     mh=getattr(routing_enums_pb2.LocalSearchMetaheuristic,metaheuristic)
