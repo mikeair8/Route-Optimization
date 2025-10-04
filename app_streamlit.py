@@ -1,5 +1,5 @@
 # app_streamlit.py
-import io, time, tempfile
+import io, time, tempfile, math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -11,7 +11,7 @@ import vrp_routes as core
 # ── App config ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="VRP Route Balancer", layout="wide")
 st.title("VRP Route Balancer")
-st.caption("FREE setup: solve with haversine; optionally refine per-leg with LOCAL OSRM (no keys).")
+st.caption("Free: optimize with Haversine or local OSRM. OR-Tools or fast heuristic. Balanced by time or distance.")
 
 # ── Persist results across reruns ─────────────────────────────────────────────
 for k in ["last_routes_csv", "last_routes_xlsx", "last_summary", "last_routes_df"]:
@@ -31,69 +31,68 @@ chosen_sep = delim_map[delim]
 # ── Top controls ──────────────────────────────────────────────────────────────
 col_top = st.columns(4)
 with col_top[0]:
-    vehicles = st.number_input("Number of routes (vehicles)", min_value=1, value=2, step=1)
+    vehicles = st.number_input("Vehicles (manual start value)", min_value=1, value=2, step=1)
 with col_top[1]:
     equality_basis = st.selectbox("Balance by", ["time","distance"], index=0)
 with col_top[2]:
     per_stop_min = st.number_input("Default service time per stop (min)", min_value=0.0, value=2.0, step=0.5)
 with col_top[3]:
-    avg_speed = st.number_input("Avg speed (km/h) for haversine", min_value=1.0, value=35.0, step=1.0)
+    avg_speed = st.number_input("Avg speed (km/h) for Haversine", min_value=1.0, value=35.0, step=1.0)
 
 with st.expander("OR-Tools (advanced)"):
     solver = st.selectbox("Solver", ["ortools","cluster2opt"], index=0)
-    first_solution = st.text_input("First solution strategy", value="PATH_CHEAPEST_ARC")
+    first_solution = st.text_input("First solution strategy", value="PARALLEL_CHEAPEST_INSERTION")
     metaheuristic = st.text_input("Local search metaheuristic", value="GUIDED_LOCAL_SEARCH")
-    time_limit_s = st.number_input("Time limit (s)", min_value=1, value=20, step=1)
-    cap_enabled = st.checkbox("Enable per-route minute cap (time)", value=False)
-    max_route_min = st.number_input("Max route minutes", min_value=0.0, value=0.0, step=5.0)
-    st.caption("Tip: For big instances, try PARALLEL_CHEAPEST_INSERTION and 120–300s.")
+    time_limit_s = st.number_input("Time limit (s)", min_value=1, value=180, step=5)
+    cap_enabled = st.checkbox("Enable per-route minute cap (manual)", value=False)
+    max_route_min = st.number_input("Max route minutes (manual cap)", min_value=0.0, value=0.0, step=5.0)
+
+with st.expander("Cost matrix & Local OSRM (free)"):
+    backend_costs = st.selectbox(
+        "Solver cost matrix",
+        ["Haversine (fast, approximate)", "OSRM (road-accurate, local)"],
+        index=0
+    )
+    osrm_base = st.text_input("Local OSRM URL", value="http://localhost:5000")
+    osrm_block = st.number_input(
+        "OSRM /table block size (tile)",
+        min_value=50, max_value=200, value=100, step=10,
+        help="Matrix is fetched in tiles of block×block; 80–120 is a good range."
+    )
+    use_osrm_refine = st.checkbox(
+        "Refine per-leg with OSRM after solving (extra requests)",
+        value=False,
+        help="Usually redundant if solver already used OSRM matrix."
+    )
+
+with st.expander("Depot & filters (optional)"):
+    use_first_row_as_depot = st.checkbox("Treat first row as depot (service=0)", value=False)
+    use_manual_depot = st.checkbox("Add manual depot (prepend)", value=False)
+    depot_lat = st.number_input("Depot latitude", value=0.0, step=0.0001, format="%.6f", disabled=not use_manual_depot)
+    depot_lon = st.number_input("Depot longitude", value=0.0, step=0.0001, format="%.6f", disabled=not use_manual_depot)
+
+    filter_active = st.checkbox("Filter only active rows", value=False)
+    active_col = st.text_input("Active column (case-insensitive)", value="Status active")
+    active_values = st.text_input("Active values (comma-separated)", value="yes, active, true, 1")
+
+with st.expander("Near-duplicate cleanup (optional)"):
+    enable_coalesce = st.checkbox("Coalesce stops within a distance", value=False)
+    coalesce_m = st.number_input("Coalesce threshold (meters)", min_value=0.1, value=1.0, step=0.5)
+    service_mode_ui = st.selectbox(
+        "Service time for a coalesced point",
+        ["Sum all services (each original counts)", "Count once (single service)"],
+        index=0
+    )
+    name_mode_ui = st.selectbox("Merged label", ["Keep first", "Concatenate with +"], index=0)
 
 with st.expander("Autosize vehicles from max route minutes"):
     autosize = st.checkbox("Autosize vehicles (time-based)", value=False)
     cap_minutes_input = st.number_input("Max route minutes (cap)", min_value=1.0, value=300.0, step=5.0)
     autosize_buffer = st.number_input(
         "Buffer factor (×)", min_value=1.00, value=1.15, step=0.05,
-        help="Safety multiplier. 1.15 = +15% headroom above the theoretical minimum."
+        help="Safety multiplier. 1.15 = +15% headroom."
     )
-    max_vehicles_limit = st.number_input(
-        "Hard max vehicles (optional, 0 = no limit)", min_value=0, value=0, step=1
-    )
-
-with st.expander("Local OSRM refinement (optional, free)"):
-    use_osrm = st.checkbox("Refine with local OSRM per leg", value=False)
-    osrm_base = st.text_input("Local OSRM URL", value="http://localhost:5000")
-    backend_costs = st.selectbox(
-        "Solver cost matrix",
-        ["Haversine (fast, approximate)", "OSRM (road-accurate, local)"],
-        index=0
-    )
-    osrm_block = st.number_input(
-        "OSRM /table block size (tile)",
-        min_value=50, max_value=200, value=100, step=10,
-        help="Bigger = fewer requests but longer URLs. 100 is a good default."
-    )
-    if use_osrm:
-        st.info("Refines leg km/min after solving via your local OSRM. One request per leg.")
-
-with st.expander("Depot & filters (optional)"):
-    use_first_row_as_depot = st.checkbox("Treat first row in CSV as depot (service=0)", value=False)
-    use_manual_depot = st.checkbox("Add manual depot (prepend)", value=False)
-    depot_lat = st.number_input("Depot latitude", value=0.0, step=0.0001, format="%.6f", disabled=not use_manual_depot)
-    depot_lon = st.number_input("Depot longitude", value=0.0, step=0.0001, format="%.6f", disabled=not use_manual_depot)
-
-    filter_active = st.checkbox("Filter only active rows", value=False)
-    active_col = st.text_input("Active column name (case-insensitive)", value="Status active")
-    active_values = st.text_input("Active values (comma-separated, case-insensitive)", value="yes, active, true, 1")
-
-with st.expander("Near-duplicate cleanup (optional)"):
-    enable_coalesce = st.checkbox("Coalesce stops within a distance", value=False)
-    coalesce_m = st.number_input("Coalesce threshold (meters)", min_value=0.1, value=1.0, step=0.5)
-    service_mode = st.selectbox(
-        "Service time for a coalesced point",
-        ["Sum all services (each original counts)", "Count once (single service)"],
-        index=0
-    )
-    name_mode = st.selectbox("Merged label", ["Keep first", "Concatenate with +"], index=0)
+    max_vehicles_limit = st.number_input("Hard max vehicles (0 = no limit)", min_value=0, value=0, step=1)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def robust_read(uploaded_file, default_sep=None):
@@ -109,7 +108,6 @@ def robust_read(uploaded_file, default_sep=None):
     return pd.read_csv(io.BytesIO(raw), encoding="latin1", sep=",", engine="python", encoding_errors="replace")
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # clean headers
     cleaned = {}
     for c in df.columns:
         cc = str(c).replace("\ufeff","").strip()
@@ -119,20 +117,19 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     # normalized lookup: lower, remove spaces/underscores/slashes
     norm = {c: c.lower().replace(" ", "").replace("_", "").replace("/", "") for c in df.columns}
     rev = {v: k for k, v in norm.items()}
-    # lat/lon aliases
     lat_src = next((rev[a] for a in ["lat","latitude","breddegrad","y"] if a in rev), None)
     lon_src = next((rev[a] for a in ["lon","longitude","lengdegrad","longitud","x"] if a in rev), None)
     if lat_src and "lat" not in df.columns: df = df.rename(columns={lat_src: "lat"})
     if lon_src and "lon" not in df.columns: df = df.rename(columns={lon_src: "lon"})
     return df
 
-def sanitize_coords(df: pd.DataFrame, per_stop_min: float) -> pd.DataFrame:
+def sanitize_coords(df: pd.DataFrame, per_stop_min_default: float) -> pd.DataFrame:
     for col in ["lat","lon"]:
         df[col] = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
         df[col] = pd.to_numeric(df[col], errors="coerce")
     if "service_min" not in df.columns:
-        df["service_min"] = per_stop_min
-    df["service_min"] = pd.to_numeric(df["service_min"], errors="coerce").fillna(per_stop_min).clip(lower=0)
+        df["service_min"] = per_stop_min_default
+    df["service_min"] = pd.to_numeric(df["service_min"], errors="coerce").fillna(per_stop_min_default).clip(lower=0)
     bad = (df["lat"].isna() | df["lon"].isna()
            | ~df["lat"].between(-90,90) | ~df["lon"].between(-180,180)
            | ~np.isfinite(df["lat"]) | ~np.isfinite(df["lon"]))
@@ -161,11 +158,10 @@ def draw_map(df_routes: pd.DataFrame):
     return m
 
 def _mst_total_minutes(durations_min: list[list[float]]) -> float:
-    """Prim's MST total weight (in minutes) over the full graph using durations."""
+    """Prim's MST total weight (minutes) then double-tree upper bound (×2)."""
     n = len(durations_min)
     if n <= 1:
         return 0.0
-    import math
     selected = [False]*n
     best = [math.inf]*n
     best[0] = 0.0
@@ -185,9 +181,47 @@ def _mst_total_minutes(durations_min: list[list[float]]) -> float:
                 w = durations_min[u][v]
                 if w < best[v]:
                     best[v] = w
-    # A (loose but safe) tour upper bound is ~2×MST (tree-doubling).
-    # We'll add service minutes separately and then divide by cap.
-    return 2.0 * total  # minutes
+    return 2.0 * total  # tree-doubling bound
+
+def solve_with_autosize_relax(
+    stops, vehicles_initial, matrix, equality_basis, per_stop_min,
+    cap_minutes, first_solution, metaheuristic, time_limit_s,
+    max_vehicles_limit=0, relax_caps=(1.0, 1.10, 1.25), add_veh_each_cap=(0, 1, 2)
+):
+    """
+    Try OR-Tools with autosized vehicles; if infeasible, relax cap and add vehicles progressively.
+    Falls back to cluster2opt if still infeasible.
+    """
+    # figure bounds
+    hard_max = max_vehicles_limit if max_vehicles_limit > 0 else (int(vehicles_initial) + 10_000)
+
+    # attempt grid: for each cap relax factor, try adding vehicles
+    for cap_factor in relax_caps:
+        cap_try = (cap_minutes * cap_factor) if (cap_minutes is not None) else None
+        for add in add_veh_each_cap:
+            v_try = min(int(vehicles_initial) + add, hard_max)
+            try:
+                return core.solve_vrp_ortools(
+                    stops, int(v_try), matrix, equality_basis, per_stop_min,
+                    cap_try, first_solution, metaheuristic, int(time_limit_s)
+                )
+            except RuntimeError:
+                continue
+
+    # progressive vehicle bump all the way to hard_max (same cap)
+    if cap_minutes is not None:
+        for v_try in range(int(vehicles_initial) + 3, hard_max + 1):
+            try:
+                return core.solve_vrp_ortools(
+                    stops, int(v_try), matrix, equality_basis, per_stop_min,
+                    cap_minutes, first_solution, metaheuristic, int(time_limit_s)
+                )
+            except RuntimeError:
+                continue
+
+    # last resort: fast heuristic so user still gets routes
+    st.warning("OR-Tools couldn't find a feasible solution after relaxation. Falling back to cluster2opt.")
+    return core.solve_vrp_cluster2opt(stops, int(max(int(vehicles_initial), 1)), matrix, equality_basis, per_stop_min)
 
 # ── Run button ────────────────────────────────────────────────────────────────
 run = st.button("🚀 Build Routes", type="primary", disabled=uploaded is None)
@@ -205,14 +239,14 @@ if run and uploaded is not None:
             st_status.update(label="Normalizing headers…", state="running")
             df = df.loc[:, ~df.columns.duplicated()]
             df = normalize_columns(df)
-            # last-chance exact-case fallback for common names
+            # last-chance exact-case fallback
             if "lat" not in df.columns:
                 exact_lat = [c for c in df.columns if c.strip().lower() == "latitude"]
                 if exact_lat: df = df.rename(columns={exact_lat[0]: "lat"})
             if "lon" not in df.columns:
                 exact_lon = [c for c in df.columns if c.strip().lower() == "longitude"]
                 if exact_lon: df = df.rename(columns={exact_lon[0]: "lon"})
-            # map id/name from your business fields
+            # map id/name from business fields
             if "Locations ID" in df.columns and "id" not in df.columns:
                 df["id"] = df["Locations ID"].astype(str)
             elif "Panel id" in df.columns and "id" not in df.columns:
@@ -248,24 +282,26 @@ if run and uploaded is not None:
             st_status.update(label="Validating coordinates…", state="running")
             df = sanitize_coords(df, per_stop_min)
 
-            # Optional: coalesce near-duplicates
+            # COALESCE
             if enable_coalesce:
-                st.status("Coalescing near-duplicate stops…")
-                smode = "sum" if service_mode.startswith("Sum") else "one"
+                st_status.update(label="Coalescing near-duplicate stops…", state="running")
+                smode = "sum" if service_mode_ui.startswith("Sum") else "one"
                 n_before = len(df)
-                df = core.coalesce_nearby(
-                    df,
-                    threshold_m=float(coalesce_m),
-                    service_mode=smode,
-                    name_mode=("concat" if name_mode.startswith("Concatenate") else "first"),
-                    per_stop_min_default=per_stop_min,
-                )
-                n_after = len(df)
-                if n_after < n_before:
-                    st.success(f"Coalesced {n_before - n_after} nearby stops into existing points "
-                               f"(now {n_after} rows; service_mode='{smode}').")
+                if hasattr(core, "coalesce_nearby"):
+                    df = core.coalesce_nearby(
+                        df,
+                        threshold_m=float(coalesce_m),
+                        service_mode=smode,
+                        name_mode=("concat" if name_mode_ui.startswith("Concatenate") else "first"),
+                        per_stop_min_default=per_stop_min,
+                    )
+                    n_after = len(df)
+                    if n_after < n_before:
+                        st.success(f"Coalesced {n_before - n_after} nearby stops (now {n_after}).")
+                    else:
+                        st.info("No near-duplicates found within the chosen threshold.")
                 else:
-                    st.info("No near-duplicates found within the chosen threshold.")
+                    st.warning("coalesce_nearby() not found in vrp_routes.py — skipping coalescing.")
 
             # Optional: first-row depot
             if use_first_row_as_depot and len(df) > 0:
@@ -282,90 +318,76 @@ if run and uploaded is not None:
                 depot_lat if use_manual_depot else None,
                 depot_lon if use_manual_depot else None
             )
-            st.write(f"📍 Total locations passed to solver (incl. depot): {len(stops)}")
+            st.write(f"📍 Total locations passed to solver (incl. depot if added): {len(stops)}")
 
             # MATRIX
             if backend_costs.startswith("OSRM"):
-                st_status.update(label="Building OSRM (road-accurate) matrix…", state="running")
-                prog = st.progress(0.0)
-
-
-                def _cb(done, total):
-                    prog.progress(done / total)
-
-
-                matrix = core.build_osrm_matrix_batched(
-                    stops,
-                    base_url=osrm_base,
-                    block=int(osrm_block),
-                    sleep=0.0,
-                    progress_cb=_cb
-                )
-                st.write("✅ OSRM matrix built")
+                if hasattr(core, "build_osrm_matrix_batched"):
+                    st_status.update(label="Building OSRM (road-accurate) matrix…", state="running")
+                    prog = st.progress(0.0)
+                    def _cb(done, total): prog.progress(done / total if total else 1.0)
+                    matrix = core.build_osrm_matrix_batched(
+                        stops,
+                        base_url=osrm_base,
+                        block=int(osrm_block),
+                        sleep=0.0,
+                        progress_cb=_cb
+                    )
+                    st.write("✅ OSRM matrix built")
+                else:
+                    st.warning("build_osrm_matrix_batched() not found in vrp_routes.py — using Haversine instead.")
+                    st_status.update(label="Building Haversine matrix…", state="running")
+                    matrix = core.build_haversine_matrix(stops, avg_speed)
+                    st.write("✅ Matrix built")
             else:
-                st_status.update(label="Building offline (haversine) matrix…", state="running")
+                st_status.update(label="Building Haversine matrix…", state="running")
                 matrix = core.build_haversine_matrix(stops, avg_speed)
                 st.write("✅ Matrix built")
 
-            # --- Autosize vehicles if requested (time-based only) ---
+            # AUTOSIZE
             vehicles_to_use = int(vehicles)
             cap_minutes_to_use = None
-            if autosize:
-                if equality_basis != "time":
-                    st.warning("Autosize is time-based. Switch 'Balance by' to 'time' to enable.")
-                else:
-                    # Compute total service minutes (exclude depot if present: service at depot is 0 in our flow)
-                    total_service_min = 0.0
-                    for s in stops:
-                        # depot is index 0 only if you added manual depot; otherwise first row is just a stop
-                        # We include all non-negative service times
-                        total_service_min += max(0.0, float(getattr(s, "service_min", 0.0)))
-
-                    # MST-based tour upper bound in minutes from the chosen matrix
-                    mst_tour_minutes = _mst_total_minutes(matrix.durations_min)
-
-                    total_minutes_est = mst_tour_minutes + total_service_min
-                    vehicles_est = int(np.ceil((total_minutes_est / cap_minutes_input) * autosize_buffer))
-
-                    if max_vehicles_limit and vehicles_est > max_vehicles_limit:
-                        vehicles_est = max_vehicles_limit
-
-                    vehicles_est = max(1, vehicles_est)
-                    vehicles_to_use = vehicles_est
-                    cap_minutes_to_use = float(cap_minutes_input)
-
-                    st.info(
-                        f"Autosize: est_total_minutes ≈ {total_minutes_est:.0f}, "
-                        f"cap={cap_minutes_input:.0f}, buffer×{autosize_buffer:.2f} ⇒ "
-                        f"vehicles={vehicles_to_use}"
-                    )
+            if autosize and equality_basis == "time":
+                total_service_min = sum(max(0.0, float(getattr(s, "service_min", 0.0))) for s in stops)
+                mst_tour_minutes = _mst_total_minutes(matrix.durations_min)
+                total_minutes_est = mst_tour_minutes + total_service_min
+                vehicles_est = int(np.ceil((total_minutes_est / cap_minutes_input) * autosize_buffer))
+                if max_vehicles_limit and vehicles_est > max_vehicles_limit:
+                    vehicles_est = max_vehicles_limit
+                vehicles_to_use = max(1, vehicles_est)
+                cap_minutes_to_use = float(cap_minutes_input)
+                st.info(
+                    f"Autosize: total≈{total_minutes_est:.0f} min, cap={cap_minutes_input:.0f}, "
+                    f"buffer×{autosize_buffer:.2f} → vehicles={vehicles_to_use}"
+                )
+            elif autosize and equality_basis != "time":
+                st.warning("Autosize is time-based. Set 'Balance by' to 'time' to enable.")
 
             # SOLVE
             st_status.update(label="Solving routes…", state="running")
             if solver == "ortools":
-                # If autosized and time-based, enforce the cap
+                # decide cap to pass
                 if autosize and equality_basis == "time":
                     max_limit = cap_minutes_to_use
-                    cap_enabled_effective = True
                 else:
-                    max_limit = (
-                        max_route_min if (cap_enabled and equality_basis == "time" and max_route_min > 0) else None)
-                    cap_enabled_effective = cap_enabled
+                    max_limit = (max_route_min if (cap_enabled and equality_basis=="time" and max_route_min > 0) else None)
 
-                sol = core.solve_vrp_ortools(
-                    stops, int(vehicles_to_use), matrix, equality_basis, per_stop_min,
-                    max_limit, first_solution, metaheuristic, int(time_limit_s)
+                # try with autosize + relaxation
+                sol = solve_with_autosize_relax(
+                    stops, vehicles_to_use, matrix, equality_basis, per_stop_min,
+                    max_limit, first_solution, metaheuristic, time_limit_s,
+                    max_vehicles_limit=max_vehicles_limit
                 )
             else:
                 sol = core.solve_vrp_cluster2opt(stops, int(vehicles_to_use), matrix, equality_basis, per_stop_min)
 
             # REFINE / EXPORT
-            if use_osrm:
+            use_refine = use_osrm_refine and not backend_costs.startswith("OSRM")
+            if use_refine:
                 st_status.update(label="Refining legs with local OSRM…", state="running")
             else:
                 st_status.update(label="Exporting results…", state="running")
 
-            use_refine = use_osrm and not backend_costs.startswith("OSRM")
             df_routes, summary = core.export_outputs(
                 stops, matrix, sol, equality_basis,
                 export_csv=None, export_xlsx=None, per_stop_min=per_stop_min,
