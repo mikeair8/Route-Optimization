@@ -92,6 +92,7 @@ with st.expander("Autosize vehicles from max route minutes"):
         "Buffer factor (×)", min_value=1.00, value=1.15, step=0.05,
         help="Safety multiplier. 1.15 = +15% headroom."
     )
+    strict_cap = st.checkbox("Strict cap (do not relax)", value=False)
     max_vehicles_limit = st.number_input("Hard max vehicles (0 = no limit)", min_value=0, value=0, step=1)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -373,10 +374,12 @@ if run and uploaded is not None:
                     max_limit = (max_route_min if (cap_enabled and equality_basis=="time" and max_route_min > 0) else None)
 
                 # try with autosize + relaxation
+                relax = (1.0,) if strict_cap else (1.0, 1.10, 1.25)
                 sol = solve_with_autosize_relax(
                     stops, vehicles_to_use, matrix, equality_basis, per_stop_min,
                     max_limit, first_solution, metaheuristic, time_limit_s,
-                    max_vehicles_limit=max_vehicles_limit
+                    max_vehicles_limit=max_vehicles_limit,
+                    relax_caps=relax
                 )
             else:
                 sol = core.solve_vrp_cluster2opt(stops, int(vehicles_to_use), matrix, equality_basis, per_stop_min)
